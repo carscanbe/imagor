@@ -116,7 +116,7 @@ ENV MALLOC_ARENA_MAX=2
 ENV LD_PRELOAD=/usr/local/lib/libjemalloc.so
 ENV XDG_CACHE_HOME=/tmp
 
-ENV PORT 8000
+ENV PORT 8080
 
 # use unprivileged user
 USER nobody
