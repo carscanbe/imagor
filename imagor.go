@@ -22,7 +22,7 @@ import (
 )
 
 // Version imagor version
-const Version = "1.7.1"
+const Version = "1.8.10"
 
 // Loader image loader interface
 type Loader interface {
@@ -49,6 +49,18 @@ type Stater interface {
 	Stat(ctx context.Context, key string) (*Stat, error)
 }
 
+// Cacher is an optional Processor interface for in-memory blob caching.
+// LoadFromCache is called by imagor.Do() before loadStorage; on a hit the cached
+// blob is passed directly to Process(), skipping loader/storage I/O entirely.
+//
+// w and h are the requested output dimensions used to determine cache eligibility,
+// not to select a blob of that size. Return (nil, false) when w or h is zero
+// (unknown size) or exceeds the cache budget — the cache holds a single downscaled
+// copy per image path and cannot safely serve those requests.
+type Cacher interface {
+	LoadFromCache(key string, w, h int) (*Blob, bool)
+}
+
 // LoadFunc function handler for Processor to call loader
 type LoadFunc func(string) (*Blob, error)
 
@@ -70,6 +82,8 @@ type Processor interface {
 type Imagor struct {
 	Unsafe                 bool
 	Signer                 imagorpath.Signer
+	GetSigner              func(*http.Request) imagorpath.Signer
+	GetResultKey           func(*http.Request, imagorpath.Params) string
 	StoragePathStyle       imagorpath.StorageHasher
 	ResultStoragePathStyle imagorpath.ResultStorageHasher
 	BasePathRedirect       string
@@ -124,7 +138,7 @@ func New(options ...Option) *Imagor {
 	if app.Debug {
 		app.debugLog()
 	}
-	if app.Signer == nil {
+	if app.Signer == nil && app.GetSigner == nil {
 		app.Signer = imagorpath.NewDefaultSigner("")
 	}
 	app.BaseParams = strings.TrimSpace(app.BaseParams)
@@ -266,8 +280,19 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 		contextDefer(ctx, cancel)
 		r = r.WithContext(ctx)
 	}
-	if !(app.Unsafe && p.Unsafe) && app.Signer != nil && p.Path != "" {
-		if hash := app.Signer.Sign(p.Path); hash != p.Hash {
+	signer := app.Signer
+	if app.GetSigner != nil {
+		signer = app.GetSigner(r)
+		if signer == nil {
+			err = ErrSignatureMismatch
+			if app.Debug {
+				app.Logger.Debug("sign-mismatch", zap.Any("params", p), zap.String("reason", "GetSigner returned nil"))
+			}
+			return
+		}
+	}
+	if !(app.Unsafe && p.Unsafe) && signer != nil && p.Path != "" {
+		if hash := signer.Sign(p.Path); hash != p.Hash {
 			err = ErrSignatureMismatch
 			if app.Debug {
 				app.Logger.Debug("sign-mismatch", zap.Any("params", p), zap.String("expected", hash))
@@ -301,7 +326,6 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 			r.Header.Set("Imagor-Raw", "1")
 			isRaw = true
 		case "preview":
-			r.Header.Set("Cache-Control", "no-cache")
 			hasPreview = true // disable result storage on preview() filter
 		}
 		// exclude utility filters from result path
@@ -320,6 +344,12 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 				Name: "format",
 				Args: "avif",
 			})
+			if app.AutoWebP && strings.Contains(accept, "image/webp") {
+				p.Filters = append(p.Filters, imagorpath.Filter{
+					Name: "fallback_format",
+					Args: "webp",
+				})
+			}
 			r.Header.Set("Imagor-Auto-Format", "avif") // response Vary: Accept header
 			isPathChanged = true
 		} else if app.AutoWebP && strings.Contains(accept, "image/webp") {
@@ -357,6 +387,9 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 			resultKey = p.Path
 		}
 	}
+	if app.GetResultKey != nil {
+		resultKey = app.GetResultKey(r, p)
+	}
 	load := func(image string) (*Blob, error) {
 		blob, _, err := app.loadStorage(r, image)
 		return blob, err
@@ -389,11 +422,28 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 		var shouldSave bool
 		if isColorImage(p.Image) {
 			// color image — skip storage/loader, processor will generate it
-		} else if blob, shouldSave, err = app.loadStorage(r, p.Image); err != nil {
-			if app.Debug {
-				app.Logger.Debug("load", zap.Any("params", p), zap.Error(err))
+		} else {
+			// Base image cache is opt-in via filters:preview().
+			// Skip cache for requests that depend on original-space coordinates or
+			// per-request decode parameters (crop, focal, page>1, dpi).
+			if hasPreview && !imagorpath.HasCacheBypass(p) {
+				for _, processor := range app.Processors {
+					if c, ok := processor.(Cacher); ok {
+						if cachedBlob, ok := c.LoadFromCache(p.Image, p.Width, p.Height); ok {
+							blob = cachedBlob
+							break
+						}
+					}
+				}
 			}
-			return blob, err
+			if isBlobEmpty(blob) {
+				if blob, shouldSave, err = app.loadStorage(r, p.Image); err != nil {
+					if app.Debug {
+						app.Logger.Debug("load", zap.Any("params", p), zap.Error(err))
+					}
+					return blob, err
+				}
+			}
 		}
 
 		sourceBlob := blob

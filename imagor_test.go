@@ -1633,7 +1633,7 @@ func TestAutoFormatPrecedence(t *testing.T) {
 		app.ServeHTTP(w, r)
 		assert.Equal(t, 200, w.Code)
 		assert.Equal(t, "Accept", w.Header().Get("Vary"))
-		assert.Equal(t, "filters:format(avif)/abc.png", w.Body.String())
+		assert.Equal(t, "filters:format(avif):fallback_format(webp)/abc.png", w.Body.String())
 	})
 
 	t.Run("WebP takes precedence over JPEG when AVIF not supported", func(t *testing.T) {
@@ -2135,6 +2135,251 @@ func TestColorImagePath(t *testing.T) {
 	})
 }
 
+// cacherProcessor is a mock processor that implements both Processor and Cacher.
+// It simulates an in-memory image cache keyed by image URL.
+// LoadFromCache returns the cached blob only when the key is in the cache AND the requested
+// dimensions (w×h) are both known (>0) and within the configured max — w and h determine
+// cache eligibility, not the size of the returned blob.
+type cacherProcessor struct {
+	cache  map[string][]byte // key → cached content
+	maxW   int
+	maxH   int
+	called int // number of times Process was called with a cached blob (cache hit)
+}
+
+func newCacherProcessor(maxW, maxH int) *cacherProcessor {
+	return &cacherProcessor{cache: map[string][]byte{}, maxW: maxW, maxH: maxH}
+}
+
+func (c *cacherProcessor) Startup(_ context.Context) error  { return nil }
+func (c *cacherProcessor) Shutdown(_ context.Context) error { return nil }
+
+// LoadFromCache returns the cached blob when:
+//   - key is in the cache
+//   - w and h are both known (>0) — unknown size must bypass cache
+//   - w <= maxW and h <= maxH — oversized requests must bypass cache
+func (c *cacherProcessor) LoadFromCache(key string, w, h int) (*Blob, bool) {
+	data, ok := c.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if w <= 0 || h <= 0 {
+		return nil, false // unknown size — cannot guarantee cache is sufficient
+	}
+	if w > c.maxW || h > c.maxH {
+		return nil, false // requested size exceeds cache max — must load original
+	}
+	return NewBlobFromBytes(data), true
+}
+
+func (c *cacherProcessor) Process(_ context.Context, blob *Blob, p imagorpath.Params, _ LoadFunc) (*Blob, error) {
+	if blob == nil {
+		return nil, ErrNotFound
+	}
+	data, _ := blob.ReadAll()
+	// Cache hit path: blob came from LoadFromCache — content matches cached data
+	if cached, ok := c.cache[p.Image]; ok && string(data) == string(cached) {
+		c.called++
+		return NewBlobFromBytes(data), nil
+	}
+	// Cache miss path: blob provided by loader, read and "cache" it
+	c.cache[p.Image] = data
+	return NewBlobFromBytes(data), nil
+}
+
+func TestWithCacher(t *testing.T) {
+	const maxW, maxH = 2400, 1800
+
+	newApp := func(proc *cacherProcessor) *Imagor {
+		return New(
+			WithUnsafe(true),
+			WithLoaders(loaderFunc(func(r *http.Request, image string) (*Blob, error) {
+				if image == "cached.jpg" || image == "other.jpg" {
+					return NewBlobFromBytes([]byte("loaded:" + image)), nil
+				}
+				return nil, ErrNotFound
+			})),
+			WithProcessors(proc),
+		)
+	}
+
+	t.Run("cache hit — known size within max — loader skipped", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// preview() opts in to base image cache
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/200x200/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "from-cache", w.Body.String())
+		assert.Equal(t, 1, proc.called, "Process should be called with cached blob on cache hit")
+	})
+
+	t.Run("cache miss — no preview filter — loader always called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// No preview() filter → cache is NOT used for base image
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/200x200/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called, "without preview() filter, cache must not be used")
+	})
+
+	t.Run("cache miss — unknown size (0x0) — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// No dimensions in URL → w=0, h=0 → LoadFromCache returns false
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		// Loader was called, processor got the loaded blob
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called, "Process should NOT be called with cached blob when size unknown")
+	})
+
+	t.Run("cache miss — width only (0 height) — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// Only width specified → h=0 → LoadFromCache returns false
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/500x0/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called)
+	})
+
+	t.Run("cache miss — size exceeds max dims — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// Requested size > maxW×maxH → LoadFromCache returns false
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/5000x4000/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called, "oversized request must bypass cache")
+	})
+
+	t.Run("cache miss — image not in cache — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		// "other.jpg" is NOT in proc.cache
+		app := newApp(proc)
+
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/200x200/filters:preview()/other.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:other.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called)
+	})
+
+	t.Run("cache hit — loader would error but is never called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		// Loader always returns error — but cache hit should skip it entirely
+		app := New(
+			WithUnsafe(true),
+			WithLoaders(loaderFunc(func(r *http.Request, image string) (*Blob, error) {
+				return nil, ErrNotFound // would fail if called
+			})),
+			WithProcessors(proc),
+		)
+
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/200x200/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "from-cache", w.Body.String())
+		assert.Equal(t, 1, proc.called)
+	})
+
+	t.Run("cache hit — exact max dims boundary — loader skipped", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("boundary-cache")
+		app := newApp(proc)
+
+		// Exactly at max dims → LoadFromCache returns true
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, fmt.Sprintf("https://example.com/unsafe/%dx%d/filters:preview()/cached.jpg", maxW, maxH), nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "boundary-cache", w.Body.String())
+		assert.Equal(t, 1, proc.called)
+	})
+
+	t.Run("cache miss — one pixel over max dims — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// One pixel over max → LoadFromCache returns false
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, fmt.Sprintf("https://example.com/unsafe/%dx%d/filters:preview()/cached.jpg", maxW+1, maxH), nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called)
+	})
+
+	t.Run("cache bypass — crop coordinates — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// 30x20:100x150/200x200/filters:preview()/cached.jpg → crop present
+		// Even with preview() and cached image, crop must bypass cache
+		// because the cache stores a downscaled copy and crop pixel coords would be wrong.
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/30x20:100x150/200x200/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called, "crop request must bypass cache even with preview()")
+	})
+
+	t.Run("cache bypass — focal filter — loader called", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// filters:preview():focal(0.5x0.5) → focal must bypass cache even with preview()
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/200x200/filters:preview():focal(0.5x0.5)/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "loaded:cached.jpg", w.Body.String())
+		assert.Equal(t, 0, proc.called, "focal filter must bypass cache even with preview()")
+	})
+
+	t.Run("preview with no crop no focal — cache used", func(t *testing.T) {
+		proc := newCacherProcessor(maxW, maxH)
+		proc.cache["cached.jpg"] = []byte("from-cache")
+		app := newApp(proc)
+
+		// preview() + no crop/focal → cache hit (regression guard)
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "https://example.com/unsafe/200x200/filters:preview()/cached.jpg", nil))
+		assert.Equal(t, 200, w.Code)
+		assert.Equal(t, "from-cache", w.Body.String())
+		assert.Equal(t, 1, proc.called, "preview() with no crop/focal should use cache")
+	})
+}
+
 type processorFunc func(ctx context.Context, blob *Blob, p imagorpath.Params, load LoadFunc) (*Blob, error)
 
 func (f processorFunc) Process(ctx context.Context, blob *Blob, p imagorpath.Params, load LoadFunc) (*Blob, error) {
@@ -2145,6 +2390,58 @@ func (f processorFunc) Startup(_ context.Context) error {
 }
 func (f processorFunc) Shutdown(_ context.Context) error {
 	return nil
+}
+
+// detectorAdderProc wraps processorFunc and implements DetectorAdder for testing.
+type detectorAdderProc struct {
+	processorFunc
+	detectors []Detector
+}
+
+func (p *detectorAdderProc) AddDetector(d Detector) { p.detectors = append(p.detectors, d) }
+
+// testDetector is a no-op Detector used in tests.
+type testDetector struct{}
+
+func (testDetector) Startup(_ context.Context) error  { return nil }
+func (testDetector) Shutdown(_ context.Context) error { return nil }
+func (testDetector) Detect(_ context.Context, _ string, _ *Blob) ([]DetectorRegion, error) {
+	return nil, nil
+}
+
+func TestWithDetector(t *testing.T) {
+	proc := &detectorAdderProc{}
+	d := testDetector{}
+	app := New(
+		WithProcessors(proc),
+		WithDetector(d),
+	)
+	require.Len(t, proc.detectors, 1)
+	assert.Equal(t, Detector(d), proc.detectors[0])
+	_ = app
+}
+
+func TestWithDetectorNil(t *testing.T) {
+	proc := &detectorAdderProc{}
+	app := New(
+		WithProcessors(proc),
+		WithDetector(nil),
+	)
+	assert.Empty(t, proc.detectors)
+	_ = app
+}
+
+func TestWithDetectors(t *testing.T) {
+	proc := &detectorAdderProc{}
+	d1, d2 := testDetector{}, testDetector{}
+	app := New(
+		WithProcessors(proc),
+		WithDetectors(d1, nil, d2),
+	)
+	require.Len(t, proc.detectors, 2, "nil entries must be skipped")
+	assert.Equal(t, Detector(d1), proc.detectors[0])
+	assert.Equal(t, Detector(d2), proc.detectors[1])
+	_ = app
 }
 
 // failingStorage is a mock storage that can be configured to fail on Put operations
@@ -2569,4 +2866,260 @@ func TestResponseRawOnError(t *testing.T) {
 		assert.Contains(t, w.Header().Get("Content-Type"), "application/json")
 		assert.Contains(t, w.Body.String(), "timeout")
 	})
+}
+
+// TestWithGetSignerOption verifies that WithGetSigner correctly wires the
+// function into the Imagor struct and that the static Signer is NOT set
+// (so New() won't install the default signer and shadow it).
+func TestWithGetSignerOption(t *testing.T) {
+	staticSigner := imagorpath.NewDefaultSigner("abc")
+
+	t.Run("sets GetSigner field", func(t *testing.T) {
+		fn := func(*http.Request) imagorpath.Signer { return staticSigner }
+		app := New(WithGetSigner(fn))
+		assert.NotNil(t, app.GetSigner, "GetSigner must be set")
+		assert.Nil(t, app.Signer, "Signer must be nil when GetSigner is provided")
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		assert.Equal(t, staticSigner, app.GetSigner(req))
+	})
+
+	t.Run("nil fn is no-op — default signer still installed", func(t *testing.T) {
+		app := New() // no WithGetSigner → default signer
+		assert.Nil(t, app.GetSigner)
+		assert.NotNil(t, app.Signer, "default signer should be set when GetSigner absent")
+	})
+
+	t.Run("GetSigner overrides static Signer — static is ignored", func(t *testing.T) {
+		otherSigner := imagorpath.NewDefaultSigner("xyz")
+		fn := func(*http.Request) imagorpath.Signer { return otherSigner }
+		// WithSigner sets app.Signer; WithGetSigner should take runtime priority
+		app := New(
+			WithSigner(staticSigner),
+			WithGetSigner(fn),
+		)
+		assert.NotNil(t, app.GetSigner)
+		assert.NotNil(t, app.Signer, "static Signer may still be set, but GetSigner wins at runtime")
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		assert.Equal(t, otherSigner, app.GetSigner(req))
+	})
+
+	t.Run("returns different signer per host", func(t *testing.T) {
+		signerA := imagorpath.NewDefaultSigner("a")
+		signerB := imagorpath.NewDefaultSigner("b")
+		fn := func(r *http.Request) imagorpath.Signer {
+			switch r.Host {
+			case "a.example.com":
+				return signerA
+			case "b.example.com":
+				return signerB
+			}
+			return nil
+		}
+		app := New(WithGetSigner(fn))
+		reqA := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqA.Host = "a.example.com"
+		reqB := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqB.Host = "b.example.com"
+		reqC := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqC.Host = "c.example.com"
+		assert.Equal(t, signerA, app.GetSigner(reqA))
+		assert.Equal(t, signerB, app.GetSigner(reqB))
+		assert.Nil(t, app.GetSigner(reqC), "unknown host should return nil")
+	})
+}
+
+// TestWithGetResultKeyOption verifies that WithGetResultKey correctly wires the
+// function into the Imagor struct and that the function is callable as expected.
+func TestWithGetResultKeyOption(t *testing.T) {
+	t.Run("sets GetResultKey field", func(t *testing.T) {
+		fn := func(r *http.Request, p imagorpath.Params) string {
+			return "tenant/" + p.Path
+		}
+		app := New(WithUnsafe(true), WithGetResultKey(fn))
+		assert.NotNil(t, app.GetResultKey, "GetResultKey must be set")
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		key := app.GetResultKey(req, imagorpath.Params{Path: "300x200/image.jpg"})
+		assert.Equal(t, "tenant/300x200/image.jpg", key)
+	})
+
+	t.Run("nil fn leaves GetResultKey unset", func(t *testing.T) {
+		app := New(WithUnsafe(true))
+		assert.Nil(t, app.GetResultKey)
+	})
+
+	t.Run("returns per-request scoped key", func(t *testing.T) {
+		fn := func(r *http.Request, p imagorpath.Params) string {
+			return r.Host + "/" + p.Path
+		}
+		app := New(WithUnsafe(true), WithGetResultKey(fn))
+		reqA := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqA.Host = "space-a.example.com"
+		reqB := httptest.NewRequest(http.MethodGet, "/", nil)
+		reqB.Host = "space-b.example.com"
+		p := imagorpath.Params{Path: "filters:format(webp)/photo.jpg"}
+		keyA := app.GetResultKey(reqA, p)
+		keyB := app.GetResultKey(reqB, p)
+		assert.Equal(t, "space-a.example.com/filters:format(webp)/photo.jpg", keyA)
+		assert.Equal(t, "space-b.example.com/filters:format(webp)/photo.jpg", keyB)
+		assert.NotEqual(t, keyA, keyB, "different hosts must produce different result keys")
+	})
+
+	t.Run("empty path returns empty key (disables result storage)", func(t *testing.T) {
+		fn := func(r *http.Request, p imagorpath.Params) string {
+			if p.Image == "" {
+				return "" // no image → no result key
+			}
+			return "tenant/" + p.Path
+		}
+		app := New(WithUnsafe(true), WithGetResultKey(fn))
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		assert.Equal(t, "", app.GetResultKey(req, imagorpath.Params{}))
+		assert.Equal(t, "tenant/200x200/photo.jpg", app.GetResultKey(req, imagorpath.Params{
+			Image: "photo.jpg",
+			Path:  "200x200/photo.jpg",
+		}))
+	})
+}
+
+func TestGetSigner(t *testing.T) {
+	secrets := map[string]string{
+		"space-a.example.com": "secret-a",
+		"space-b.example.com": "secret-b",
+	}
+	// WithDebug(true) is required here so the nil-signer debug-log branch is covered.
+	app := New(
+		WithDebug(true),
+		WithLogger(zap.NewExample()),
+		WithLoaders(loaderFunc(func(r *http.Request, key string) (*Blob, error) {
+			return NewBlobFromBytes([]byte("fake")), nil
+		})),
+		WithGetSigner(func(r *http.Request) imagorpath.Signer {
+			secret, ok := secrets[r.Host]
+			if !ok {
+				return nil
+			}
+			return imagorpath.NewHMACSigner(sha256.New, 0, secret)
+		}),
+	)
+
+	// Valid request for space-a
+	signerA := imagorpath.NewHMACSigner(sha256.New, 0, "secret-a")
+	path := imagorpath.Generate(imagorpath.Params{Image: "photo.jpg", Width: 300, Height: 200}, signerA)
+	req := httptest.NewRequest(http.MethodGet, "/"+path, nil)
+	req.Host = "space-a.example.com"
+	w := httptest.NewRecorder()
+	app.ServeHTTP(w, req)
+	assert.Equal(t, 200, w.Code)
+
+	// Space-A HMAC on space-B request → signature mismatch (wrong hash, not nil signer)
+	req2 := httptest.NewRequest(http.MethodGet, "/"+path, nil)
+	req2.Host = "space-b.example.com"
+	w2 := httptest.NewRecorder()
+	app.ServeHTTP(w2, req2)
+	assert.Equal(t, 403, w2.Code)
+	assert.Equal(t, jsonStr(ErrSignatureMismatch), w2.Body.String())
+
+	// Unknown host → GetSigner returns nil → ErrSignatureMismatch (debug branch covered)
+	req3 := httptest.NewRequest(http.MethodGet, "/"+path, nil)
+	req3.Host = "unknown.example.com"
+	w3 := httptest.NewRecorder()
+	app.ServeHTTP(w3, req3)
+	assert.Equal(t, 403, w3.Code)
+	assert.Equal(t, jsonStr(ErrSignatureMismatch), w3.Body.String())
+
+	// Valid request for space-b with space-b signer
+	signerB := imagorpath.NewHMACSigner(sha256.New, 0, "secret-b")
+	pathB := imagorpath.Generate(imagorpath.Params{Image: "photo.jpg", Width: 300, Height: 200}, signerB)
+	req4 := httptest.NewRequest(http.MethodGet, "/"+pathB, nil)
+	req4.Host = "space-b.example.com"
+	w4 := httptest.NewRecorder()
+	app.ServeHTTP(w4, req4)
+	assert.Equal(t, 200, w4.Code)
+
+	// Unsafe mode + nil GetSigner → still 403.
+	// GetSigner returning nil means "tenant not recognised" — this is a hard deny
+	// regardless of unsafe mode. Unsafe only bypasses the HMAC hash check, not
+	// tenant identity resolution.
+	appUnsafe := New(
+		WithDebug(true),
+		WithLogger(zap.NewExample()),
+		WithUnsafe(true),
+		WithLoaders(loaderFunc(func(r *http.Request, key string) (*Blob, error) {
+			return NewBlobFromBytes([]byte("fake")), nil
+		})),
+		WithGetSigner(func(r *http.Request) imagorpath.Signer {
+			return nil // always unknown tenant
+		}),
+	)
+	reqUnsafe := httptest.NewRequest(http.MethodGet, "/unsafe/photo.jpg", nil)
+	reqUnsafe.Host = "unknown.example.com"
+	wUnsafe := httptest.NewRecorder()
+	appUnsafe.ServeHTTP(wUnsafe, reqUnsafe)
+	assert.Equal(t, 403, wUnsafe.Code, "nil GetSigner must deny even in unsafe mode")
+	assert.Equal(t, jsonStr(ErrSignatureMismatch), wUnsafe.Body.String())
+}
+
+func TestGetResultKey(t *testing.T) {
+	baseDomain := ".example.com"
+	app := New(
+		WithUnsafe(true),
+		WithLoaders(loaderFunc(func(r *http.Request, key string) (*Blob, error) {
+			return NewBlobFromBytes([]byte("fake")), nil
+		})),
+		WithGetResultKey(func(r *http.Request, p imagorpath.Params) string {
+			host := r.Host
+			if strings.HasSuffix(host, baseDomain) {
+				spaceKey := strings.TrimSuffix(host, baseDomain)
+				if spaceKey != "" && p.Image != "" {
+					return spaceKey + "/" + p.Path
+				}
+			}
+			return p.Path
+		}),
+	)
+
+	// Same path, different hosts → different result keys, different responses
+	reqA := httptest.NewRequest(http.MethodGet, "/unsafe/300x200/photo.jpg", nil)
+	reqA.Host = "space-a.example.com"
+	wA := httptest.NewRecorder()
+	app.ServeHTTP(wA, reqA)
+	assert.Equal(t, 200, wA.Code)
+
+	reqB := httptest.NewRequest(http.MethodGet, "/unsafe/300x200/photo.jpg", nil)
+	reqB.Host = "space-b.example.com"
+	wB := httptest.NewRecorder()
+	app.ServeHTTP(wB, reqB)
+	assert.Equal(t, 200, wB.Code)
+
+	// Verify GetResultKey is scoping correctly by checking with result storage:
+	// space-a and space-b result keys must be distinct
+	resultStore := newMapStore()
+	appWithStorage := New(
+		WithUnsafe(true),
+		WithLoaders(loaderFunc(func(r *http.Request, key string) (*Blob, error) {
+			return NewBlobFromBytes([]byte("data-" + r.Host)), nil
+		})),
+		WithResultStorages(resultStore),
+		WithGetResultKey(func(r *http.Request, p imagorpath.Params) string {
+			host := r.Host
+			if strings.HasSuffix(host, baseDomain) {
+				spaceKey := strings.TrimSuffix(host, baseDomain)
+				if spaceKey != "" && p.Image != "" {
+					return spaceKey + "/" + p.Path
+				}
+			}
+			return p.Path
+		}),
+	)
+
+	reqA2 := httptest.NewRequest(http.MethodGet, "/unsafe/photo.jpg", nil)
+	reqA2.Host = "space-a.example.com"
+	wA2 := httptest.NewRecorder()
+	appWithStorage.ServeHTTP(wA2, reqA2)
+	time.Sleep(time.Millisecond * 20) // wait for async save
+	assert.Equal(t, 200, wA2.Code)
+
+	// Result for space-a is stored under "space-a/photo.jpg", not "photo.jpg"
+	assert.NotNil(t, resultStore.Map["space-a/photo.jpg"])
+	assert.Nil(t, resultStore.Map["photo.jpg"])
 }

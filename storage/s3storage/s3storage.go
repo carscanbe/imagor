@@ -26,6 +26,7 @@ type S3Storage struct {
 	BaseDir        string
 	PathPrefix     string
 	ACL            string
+	Tagging        string
 	SafeChars      string
 	StorageClass   string
 	Expiration     time.Duration
@@ -38,16 +39,18 @@ type S3Storage struct {
 // New creates S3Storage
 func New(cfg aws.Config, bucket string, options ...Option) *S3Storage {
 	baseDir := "/"
-	if idx := strings.Index(bucket, "/"); idx > -1 {
-		baseDir = bucket[idx:]
-		bucket = bucket[:idx]
+	// Only extract baseDir from bucket path when not in wildcard mode
+	if bucket != "*" {
+		if idx := strings.Index(bucket, "/"); idx > -1 {
+			baseDir = bucket[idx:]
+			bucket = bucket[:idx]
+		}
 	}
 	s := &S3Storage{
 		Bucket: bucket,
 
 		BaseDir:    baseDir,
 		PathPrefix: "/",
-		ACL:        string(types.ObjectCannedACLPublicRead),
 	}
 	for _, option := range options {
 		option(s)
@@ -78,6 +81,45 @@ func New(cfg aws.Config, bucket string, options ...Option) *S3Storage {
 	return s
 }
 
+// resolve returns the resolved (bucket, key, ok) for the given image path.
+// When Bucket is "*", the first path segment is used as the bucket name and
+// the remainder as the key — enabling dynamic bucket-from-path routing
+// (compatible with tc_aws behaviour when TC_AWS_BUCKET is unset).
+func (s *S3Storage) resolve(image string) (bucket, key string, ok bool) {
+	if s.Bucket == "*" {
+		// Strip leading slash, then split on first "/"
+		trimmed := strings.TrimPrefix(image, "/")
+		idx := strings.Index(trimmed, "/")
+		if idx == -1 {
+			// No slash — no key portion, treat as invalid
+			return "", "", false
+		}
+		bucket = trimmed[:idx]
+		rest := trimmed[idx:] // e.g. "/images/photo.jpg"
+		if bucket == "" {
+			return "", "", false
+		}
+		key, ok = s.pathFromNormalized(rest)
+		return bucket, key, ok
+	}
+	key, ok = s.Path(image)
+	return s.Bucket, key, ok
+}
+
+// pathFromNormalized computes the storage key from an already-slash-prefixed path,
+// applying PathPrefix and BaseDir transformations.
+func (s *S3Storage) pathFromNormalized(image string) (string, bool) {
+	image = "/" + imagorpath.Normalize(strings.TrimPrefix(image, "/"), s.safeChars)
+	if !strings.HasPrefix(image, s.PathPrefix) {
+		return "", false
+	}
+	result := filepath.Join(s.BaseDir, strings.TrimPrefix(image, s.PathPrefix))
+	if len(result) > 0 && result[0] == '/' {
+		result = result[1:]
+	}
+	return result, true
+}
+
 // Path transforms and validates image key for storage path
 func (s *S3Storage) Path(image string) (string, bool) {
 	image = "/" + imagorpath.Normalize(image, s.safeChars)
@@ -94,7 +136,7 @@ func (s *S3Storage) Path(image string) (string, bool) {
 // Get implements imagor.Storage interface
 func (s *S3Storage) Get(r *http.Request, image string) (*imagor.Blob, error) {
 	ctx := r.Context()
-	image, ok := s.Path(image)
+	bucket, image, ok := s.resolve(image)
 	if !ok {
 		return nil, imagor.ErrInvalid
 	}
@@ -102,7 +144,7 @@ func (s *S3Storage) Get(r *http.Request, image string) (*imagor.Blob, error) {
 	var once sync.Once
 	blob = imagor.NewBlob(func() (io.ReadCloser, int64, error) {
 		input := &s3.GetObjectInput{
-			Bucket: aws.String(s.Bucket),
+			Bucket: aws.String(bucket),
 			Key:    aws.String(image),
 		}
 		out, err := s.Client.GetObject(ctx, input)
@@ -140,7 +182,7 @@ func (s *S3Storage) Get(r *http.Request, image string) (*imagor.Blob, error) {
 
 // Put implements imagor.Storage interface
 func (s *S3Storage) Put(ctx context.Context, image string, blob *imagor.Blob) error {
-	image, ok := s.Path(image)
+	bucket, image, ok := s.resolve(image)
 	if !ok {
 		return imagor.ErrInvalid
 	}
@@ -154,7 +196,7 @@ func (s *S3Storage) Put(ctx context.Context, image string, blob *imagor.Blob) er
 
 	input := &s3.PutObjectInput{
 		Body:          reader,
-		Bucket:        aws.String(s.Bucket),
+		Bucket:        aws.String(bucket),
 		ContentType:   aws.String(blob.ContentType()),
 		ContentLength: aws.Int64(size),
 		Key:           aws.String(image),
@@ -163,18 +205,21 @@ func (s *S3Storage) Put(ctx context.Context, image string, blob *imagor.Blob) er
 	if s.ACL != "" {
 		input.ACL = types.ObjectCannedACL(s.ACL)
 	}
+	if s.Tagging != "" {
+		input.Tagging = aws.String(s.Tagging)
+	}
 	_, err = s.Client.PutObject(ctx, input)
 	return err
 }
 
 // Delete implements imagor.Storage interface
 func (s *S3Storage) Delete(ctx context.Context, image string) error {
-	image, ok := s.Path(image)
+	bucket, image, ok := s.resolve(image)
 	if !ok {
 		return imagor.ErrInvalid
 	}
 	_, err := s.Client.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(s.Bucket),
+		Bucket: aws.String(bucket),
 		Key:    aws.String(image),
 	})
 	return err
@@ -182,12 +227,12 @@ func (s *S3Storage) Delete(ctx context.Context, image string) error {
 
 // Stat implements imagor.Storage interface
 func (s *S3Storage) Stat(ctx context.Context, image string) (stat *imagor.Stat, err error) {
-	image, ok := s.Path(image)
+	bucket, image, ok := s.resolve(image)
 	if !ok {
 		return nil, imagor.ErrInvalid
 	}
 	input := &s3.HeadObjectInput{
-		Bucket: aws.String(s.Bucket),
+		Bucket: aws.String(bucket),
 		Key:    aws.String(image),
 	}
 	head, err := s.Client.HeadObject(ctx, input)
