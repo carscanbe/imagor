@@ -1,3 +1,13 @@
+---
+description: Configure imagor loaders, source storage, and result storage for HTTP, file system, AWS S3, and Google Cloud Storage.
+keywords:
+  - imagor storage
+  - imagor loader
+  - imagor result storage
+  - imagor s3 storage
+  - imagor google cloud storage
+---
+
 # Loader, Storage, Result Storage
 
 imagor `Loader`, `Storage` and `Result Storage` are the building blocks for loading and saving images from various sources:

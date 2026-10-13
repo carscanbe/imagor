@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cshum/imagor/imagorpath"
@@ -22,7 +23,7 @@ import (
 )
 
 // Version imagor version
-const Version = "1.8.10"
+const Version = "1.9.9"
 
 // Loader image loader interface
 type Loader interface {
@@ -102,6 +103,8 @@ type Imagor struct {
 	AutoWebP               bool
 	AutoAVIF               bool
 	AutoJPEG               bool
+	PassthroughFormats     []BlobType
+	SanitizeSVG            bool
 	ModifiedTimeCheck      bool
 	DisableErrorBody       bool
 	DisableParamsEndpoint  bool
@@ -127,6 +130,7 @@ func New(options ...Option) *Imagor {
 		ProcessTimeout: time.Second * 20,
 		CacheHeaderTTL: time.Hour * 24 * 7,
 		CacheHeaderSWR: time.Hour * 24,
+		SanitizeSVG:    true,
 	}
 	for _, option := range options {
 		option(app)
@@ -291,7 +295,10 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 			return
 		}
 	}
-	if !(app.Unsafe && p.Unsafe) && signer != nil && p.Path != "" {
+	// A nested path: source is authorised by the outer request's signature — the
+	// nested path is part of the outer p.Path — so it is not re-signed. Without
+	// this, every nested path fails with 403 whenever a signer is configured.
+	if !isNestedRequest(ctx) && !(app.Unsafe && p.Unsafe) && signer != nil && p.Path != "" {
 		if hash := signer.Sign(p.Path); hash != p.Hash {
 			err = ErrSignatureMismatch
 			if app.Debug {
@@ -330,15 +337,31 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 		}
 		// exclude utility filters from result path
 		switch f.Name {
-		case "expire", "attachment":
+		case "expire", "attachment", "max_age":
 			isPathChanged = true
 		default:
 			p.Filters = append(p.Filters, f)
 		}
 	}
+	// Passthrough: a no-op request is marked so the processor may serve the source
+	// untouched. The filter lands in the result storage key, so a passthrough
+	// result and a rasterized result never share an entry. The source is not
+	// loaded yet at this point, so eligibility is transformations alone.
+	if len(app.PassthroughFormats) > 0 && passthroughEligible(p) {
+		p.Filters = append(p.Filters, imagorpath.Filter{
+			Name: PassthroughFilterName,
+		})
+		isPathChanged = true
+	}
 	// auto WebP / AVIF / JPEG
 	if !hasFormat && (app.AutoWebP || app.AutoAVIF || app.AutoJPEG) {
 		accept := r.Header.Get("Accept")
+		// The selected representation depends on Accept even when negotiation ends up
+		// keeping the source format (e.g. Accept: */* with only auto-avif/webp on).
+		// Mark it upfront so such responses still carry Vary: Accept - without it a
+		// shared cache may reuse the source-format response for clients that would
+		// have been served AVIF/WebP.
+		r.Header.Set("Imagor-Auto-Format", "none")
 		if app.AutoAVIF && strings.Contains(accept, "image/avif") {
 			p.Filters = append(p.Filters, imagorpath.Filter{
 				Name: "format",
@@ -395,12 +418,18 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 		return blob, err
 	}
 	return app.suppress(ctx, resultKey, func(ctx context.Context, cb func(*Blob, error)) (*Blob, error) {
+		var blob *Blob
+		var err error
 		if resultKey != "" && !isRaw {
 			if blob := app.loadResult(r, resultKey, p.Image); blob != nil {
 				return blob, nil
 			}
 		}
-		if app.queueSema != nil && !isRaw {
+		// A nested path: source is already inside the outer request's concurrency
+		// slot; acquiring another here would deadlock or, when the queue is one
+		// slot wide, fail every nested request with 429.
+		var nestedReq = isNestedRequest(ctx)
+		if app.queueSema != nil && !isRaw && !nestedReq {
 			if !app.queueSema.TryAcquire(1) {
 				err = ErrTooManyRequests
 				if app.Debug {
@@ -410,7 +439,7 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 			}
 			defer app.queueSema.Release(1)
 		}
-		if app.sema != nil && !isRaw {
+		if app.sema != nil && !isRaw && !nestedReq {
 			if err = app.sema.Acquire(ctx, 1); err != nil {
 				if app.Debug {
 					app.Logger.Debug("acquire", zap.Error(err))
@@ -422,6 +451,30 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 		var shouldSave bool
 		if isColorImage(p.Image) {
 			// color image — skip storage/loader, processor will generate it
+		} else if nestedPath, ok := isNestedPath(p.Image); ok {
+			// nested path — resolve in-process. The nested path is authorised by the
+			// outer request's signature, so it is not re-signed; the depth bound
+			// stops a self-referencing path from recursing until the stack runs out.
+			if depth := nestedDepthFromContext(ctx); depth >= MaxNestedDepth {
+				err = ErrTooManyNestedLevels
+				if app.Debug {
+					app.Logger.Debug("nested-depth", zap.Any("params", p), zap.Int("depth", depth))
+				}
+				return blob, err
+			}
+			// f-tokens in the nested path resolve against this request's own
+			// dimensions, so fxf/f-20xf-20 inherit the parent the same way they
+			// do inside image().
+			nestedPath = imagorpath.ResolveFullDimensions(nestedPath, p.Width, p.Height)
+			nestedParams := imagorpath.Parse(nestedPath)
+			nestedParams.Unsafe = true
+			nestedReq := r.WithContext(withNestedDepth(ctx, nestedDepthFromContext(ctx)+1))
+			if blob, err = app.Do(nestedReq, nestedParams); err != nil {
+				if app.Debug {
+					app.Logger.Debug("nested-path", zap.Any("params", nestedParams), zap.Error(err))
+				}
+				return blob, err
+			}
 		} else {
 			// Base image cache is opt-in via filters:preview().
 			// Skip cache for requests that depend on original-space coordinates or
@@ -454,15 +507,26 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 			if app.StoragePathStyle != nil {
 				storageKey = app.StoragePathStyle.Hash(p.Image)
 			}
-			go func(blob *Blob) {
+			go func(ctx context.Context, blob *Blob) {
 				app.saveWithErrorHandling(ctx, app.Storages, storageKey, blob)
 				close(doneSave)
-			}(blob)
+			}(ctx, blob)
 		}
 		if isBlobEmpty(blob) && !isColorImage(p.Image) {
 			return blob, err
 		}
-		if !isRaw {
+		// Passthrough: served from the source bytes, so the processors are skipped.
+		// Unlike raw(), the result is still cached.
+		var passthroughServed bool
+		if out, handled, ptErr := app.servePassthrough(p, blob); handled || ptErr != nil {
+			passthroughServed = true
+			if ptErr != nil {
+				err = ptErr
+			} else {
+				blob = out
+			}
+		}
+		if !isRaw && !passthroughServed {
 			var cancel func()
 			if app.ProcessTimeout > 0 {
 				ctx, cancel = context.WithTimeout(ctx, app.ProcessTimeout)
@@ -509,7 +573,7 @@ func (app *Imagor) Do(r *http.Request, p imagorpath.Params) (blob *Blob, err err
 		ctx = detachContext(ctx)
 		if err == nil && !isBlobEmpty(blob) && resultKey != "" && !isRaw &&
 			len(app.ResultStorages) > 0 {
-			app.saveWithErrorHandling(ctx, app.ResultStorages, resultKey, blob)
+			app.saveWithErrorHandling(ContextWithSourceImageKey(ctx, p.Image), app.ResultStorages, resultKey, blob)
 		}
 		if err != nil && shouldSave {
 			var storageKey = p.Image
@@ -551,6 +615,19 @@ func (app *Imagor) handlePostRequest(w http.ResponseWriter, r *http.Request) {
 	// Process the upload through normal imagor pipeline
 	blob, err := checkBlob(app.Do(r, p))
 	if err != nil {
+		if app.ResponseRawOnError && !isBlobEmpty(blob) {
+			e := WrapError(err)
+			app.Logger.Warn("response-raw-on-error",
+				zap.Any("params", p),
+				zap.Error(err),
+				zap.Int("status", e.Code))
+
+			w.WriteHeader(e.Code)
+			app.setResponseHeaders(w, r, blob, p)
+			reader, size, _ := blob.NewReader()
+			writeBody(w, r, reader, size)
+			return
+		}
 		app.handleErrorResponse(w, r, err)
 		return
 	}
@@ -580,6 +657,7 @@ func (app *Imagor) requestWithLoadContext(r *http.Request) *http.Request {
 
 func (app *Imagor) loadResult(r *http.Request, resultKey, imageKey string) *Blob {
 	r = app.requestWithLoadContext(r)
+	r = r.WithContext(ContextWithSourceImageKey(r.Context(), imageKey))
 	ctx := r.Context()
 	blob, origin, err := fromStorages(r, app.ResultStorages, resultKey)
 	if err == nil && !isBlobEmpty(blob) {
@@ -648,7 +726,11 @@ func fromStorages(
 	r *http.Request, storages []Storage, key string,
 ) (blob *Blob, origin Storage, err error) {
 	for _, storage := range storages {
-		b, e := checkBlob(storage.Get(r, key))
+		b, e := storage.Get(r, key)
+		if b != nil {
+			b.setFanout(false)
+		}
+		b, e = checkBlob(b, e)
 		if !isBlobEmpty(b) {
 			blob = b
 			if e == nil {
@@ -682,7 +764,11 @@ func (app *Imagor) fromStoragesAndLoaders(
 			// For POST uploads, try loaders even with empty image key
 			if r.Method == http.MethodPost {
 				for _, loader := range loaders {
-					b, e := checkBlob(loader.Get(r, image))
+					b, e := loader.Get(r, image)
+					if b != nil {
+						b.setFanout(image != "" && len(storages) > 0)
+					}
+					b, e = checkBlob(b, e)
 					if !isBlobEmpty(b) {
 						blob = b
 						if e == nil {
@@ -712,7 +798,11 @@ func (app *Imagor) fromStoragesAndLoaders(
 		}
 	}
 	for _, loader := range loaders {
-		b, e := checkBlob(loader.Get(r, image))
+		b, e := loader.Get(r, image)
+		if b != nil {
+			b.setFanout(image != "" && len(storages) > 0)
+		}
+		b, e = checkBlob(b, e)
 		if !isBlobEmpty(b) {
 			blob = b
 			if e == nil {
@@ -826,18 +916,18 @@ func (app *Imagor) suppress(
 	cb := func(blob *Blob, err error) {
 		chanCb <- singleflight.Result{Val: blob, Err: err}
 	}
-	isCanceled := false
+	var isCanceled atomic.Bool
 	ch := app.g.DoChan(key, func() (v interface{}, err error) {
 		v, err = fn(context.WithValue(ctx, suppressKey{key}, true), cb)
 		if errors.Is(err, context.Canceled) {
 			app.g.Forget(key)
-			isCanceled = true
+			isCanceled.Store(true)
 		}
 		return v, err
 	})
 	select {
 	case res := <-ch:
-		if !isCanceled && errors.Is(res.Err, context.Canceled) {
+		if !isCanceled.Load() && errors.Is(res.Err, context.Canceled) {
 			// resolve canceled
 			return app.suppress(ctx, key, fn)
 		}
@@ -858,16 +948,22 @@ func (app *Imagor) setResponseHeaders(w http.ResponseWriter, r *http.Request, bl
 		w.Header().Set("Content-Type", "application/octet-stream")
 		return
 	}
-	w.Header().Set("Content-Type", blob.ContentType())
+	contentType := blob.ContentType()
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", getContentDisposition(p, blob))
 	setCacheHeaders(w, r, getTtl(p, app.CacheHeaderTTL), app.CacheHeaderSWR)
 
 	if r.Header.Get("Imagor-Auto-Format") != "" {
 		w.Header().Add("Vary", "Accept")
 	}
-	if r.Header.Get("Imagor-Raw") != "" {
-		w.Header().Set("Content-Security-Policy", "script-src 'none'")
+	// Markup headers are set here rather than in the processor that produced them,
+	// so the policy also holds for a result cache hit, which replays only bytes.
+	if contentType == SVGContentType || r.Header.Get("Imagor-Raw") != "" {
+		w.Header().Set("Content-Security-Policy", SVGContentSecurityPolicy)
 	}
+	// The content type comes from sniffing the bytes; nosniff stops a browser
+	// deciding otherwise in an HTML context.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if h := blob.Header; h != nil {
 		for key := range h {
 			w.Header().Set(key, h.Get(key))
@@ -958,17 +1054,36 @@ func checkStatNotModified(w http.ResponseWriter, r *http.Request, stat *Stat) bo
 }
 
 func getTtl(p imagorpath.Params, defaultTtl time.Duration) time.Duration {
+	var ttl = defaultTtl
+	var expireTtl time.Duration
+	var hasExpire bool
 	for _, f := range p.Filters {
-		if f.Name == "expire" {
+		switch f.Name {
+		case "max_age":
+			// max_age(seconds) overrides the configured ttl, without cap.
+			// Negative or non numeric values are ignored, as in thumbor
+			if secs, e := strconv.ParseInt(f.Args, 10, 64); e == nil && secs >= 0 {
+				ttl = time.Duration(secs) * time.Second
+			}
+		case "expire":
+			// expire(timestamp) is unix milliseconds, rounded up to the next second
 			if ts, e := strconv.ParseInt(f.Args, 10, 64); e == nil {
-				ttl := (time.UnixMilli(ts).Sub(time.Now()) + time.Second - 1).Truncate(time.Second)
-				if ttl <= defaultTtl {
-					return ttl
+				expTtl := (time.UnixMilli(ts).Sub(time.Now()) + time.Second - 1).Truncate(time.Second)
+				if !hasExpire || expTtl < expireTtl {
+					expireTtl = expTtl
+					hasExpire = true
 				}
 			}
 		}
 	}
-	return defaultTtl
+	// both filters set the response ttl in duration space, most restrictive wins
+	if hasExpire && expireTtl < ttl {
+		ttl = expireTtl
+	}
+	if ttl < 0 {
+		ttl = 0
+	}
+	return ttl
 }
 
 func setCacheHeaders(w http.ResponseWriter, r *http.Request, ttl, swr time.Duration) {
@@ -1060,6 +1175,28 @@ func getContentDisposition(p imagorpath.Params, blob *Blob) string {
 // isColorImage checks if the image path is a color image specification (color:xxx)
 func isColorImage(image string) bool {
 	return strings.HasPrefix(strings.ToLower(image), "color:")
+}
+
+// NestedPathPrefix marks a source that is itself an imagor path rather than a URL
+// or a storage key: 400x400/path:1200x628/filters:.../photo.jpg
+//
+// The nested path is parsed and processed in-process, so a transformation that
+// only needs bytes this process already has does not require the server to be
+// able to reach itself over the network.
+const NestedPathPrefix = "path:"
+
+// isNestedPath reports whether a source is a nested imagor path, returning the
+// decoded path if so. The path is percent-decoded because it contains the same
+// separators as the outer path.
+func isNestedPath(image string) (string, bool) {
+	path, ok := strings.CutPrefix(image, NestedPathPrefix)
+	if !ok {
+		return "", false
+	}
+	if unescaped, err := url.QueryUnescape(path); err == nil {
+		path = unescaped
+	}
+	return path, path != ""
 }
 
 func getType(v interface{}) string {

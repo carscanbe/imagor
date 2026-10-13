@@ -1,3 +1,13 @@
+---
+description: Complete imagor configuration reference covering command-line flags, environment variables, loaders, storage, security, processing, and deployment settings.
+keywords:
+  - imagor configuration
+  - imagor environment variables
+  - imagor flags
+  - imagor settings
+  - imagor config
+---
+
 # Configuration
 
 imagor supports command-line arguments and environment variables. Environment variables are the flag name in uppercase snake case — `-imagor-secret` becomes `IMAGOR_SECRET`:
@@ -55,6 +65,9 @@ IMAGOR_UNSAFE=1            # Disable URL signature check (development only)
 IMAGOR_AUTO_WEBP=1         # Serve WebP automatically if browser supports
 IMAGOR_AUTO_AVIF=1         # Serve AVIF automatically if browser supports (experimental)
 IMAGOR_AUTO_JPEG=1         # Serve JPEG automatically if JPEG or no format requested
+
+IMAGOR_PASSTHROUGH_FORMATS=svg  # Serve a source format as-is for requests that ask for nothing: svg, or unset
+IMAGOR_SANITIZE_SVG=1       # Sanitize SVG before serving it through pass-through (default)
 
 IMAGOR_BASE_PARAMS=        # Base params applied to all images e.g. filters:watermark(logo.png)
 IMAGOR_SIGNER_TYPE=sha1    # URL signature algorithm: sha1, sha256, sha512 (default sha1)
@@ -229,8 +242,10 @@ UPLOAD_LOADER_FORM_FIELD_NAME=image     # Multipart form field name (default ima
 
 ## VIPS / Image Processing
 
+`VIPS_CONCURRENCY` sets the maximum number of libvips worker threads available to an individual image operation. It does not limit how many requests imagor processes at once; use `IMAGOR_PROCESS_CONCURRENCY` under [Imagor Core](#imagor-core) for request-level concurrency. Most deployments should keep `VIPS_CONCURRENCY` at `1`; change it only after benchmarking your workload. See [Benchmarks](./benchmarks.mdx) for measured comparisons.
+
 ```dotenv
-VIPS_CONCURRENCY=1           # libvips thread count per operation. -1 = auto (all CPU cores)
+VIPS_CONCURRENCY=1           # libvips threads per operation. -1 = all CPU cores
 
 # Safety limits
 VIPS_MAX_WIDTH=              # Maximum image width in pixels
@@ -238,14 +253,17 @@ VIPS_MAX_HEIGHT=             # Maximum image height in pixels
 VIPS_MAX_RESOLUTION=         # Maximum image resolution (width × height)
 VIPS_UNLIMITED=1             # Bypass all resolution limits (not recommended for public endpoints)
 VIPS_MAX_ANIMATION_FRAMES=   # Max animation frames to load. 1 = disable animation, -1 = unlimited
-VIPS_MAX_FILTER_OPS=-1       # Max filter operations per request (-1 = unlimited)
+VIPS_MAX_FILTER_OPS=-1       # Max filter operations per request. Some filters, such as
+                             # format and quality, are not counted. -1 = unlimited
 VIPS_DISABLE_BLUR=1          # Disable all blur operations
 VIPS_DISABLE_FILTERS=blur,watermark  # Disable specific filters (csv)
 
 # Output
 VIPS_MOZJPEG=1               # Use MozJPEG for JPEG encoding (requires imagor-mozjpeg build)
 VIPS_AVIF_SPEED=8            # AVIF encode speed: 0 (smallest) to 9 (fastest). Default 8
+VIPS_STRIP_COLOR_PROFILE=1   # Strip embedded ICC color profiles while preserving other metadata
 VIPS_STRIP_METADATA=1        # Strip all metadata from output images
+VIPS_VECTOR=167772160        # libvips vector target disable bitmask; matches native VIPS_VECTOR semantics
 
 # Smart crop
 VIPS_DETECTOR_PROBE_SIZE=400  # Probe image size for smart crop detection (default 400)

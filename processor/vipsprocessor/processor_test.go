@@ -1,10 +1,12 @@
 package vipsprocessor
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/gif"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -38,6 +40,12 @@ type test struct {
 	checkTypeOnly bool
 	arm64Golden   bool
 }
+
+type nonSeekableReadCloser struct {
+	io.Reader
+}
+
+func (r *nonSeekableReadCloser) Close() error { return nil }
 
 func TestMain(m *testing.M) {
 	vips.Startup(&vips.Config{
@@ -127,6 +135,22 @@ func TestProcessor(t *testing.T) {
 			{name: "lossless skips max_bytes retry", path: "filters:format(webp):lossless():max_bytes(100)/gopher-front.png", arm64Golden: true},
 		}, WithDebug(true), WithLogger(zap.NewExample()))
 	})
+	t.Run("vips lossless webp round-trip", func(t *testing.T) {
+		src, err := vips.NewImageFromFile(filepath.Join(testDataDir, "gopher-front.png"), nil)
+		require.NoError(t, err)
+		defer src.Close()
+
+		buf, err := v.export(src, vips.ImageTypeWebp, 0, 0, false, 0, false, true)
+		require.NoError(t, err)
+
+		out, err := vips.NewImageFromBuffer(buf, nil)
+		require.NoError(t, err)
+		defer out.Close()
+
+		require.Equal(t, src.Width(), out.Width(), "width must match")
+		require.Equal(t, src.Height(), out.Height(), "height must match")
+		require.Equal(t, src.Bands(), out.Bands(), "band count must match")
+	})
 	t.Run("vips lossless round-trip pixel-exact", func(t *testing.T) {
 		src, err := vips.NewImageFromFile(filepath.Join(testDataDir, "gopher-front.png"), nil)
 		require.NoError(t, err)
@@ -136,7 +160,6 @@ func TestProcessor(t *testing.T) {
 			name   string
 			format vips.ImageType
 		}{
-			{"webp", vips.ImageTypeWebp},
 			{"jxl", vips.ImageTypeJxl},
 			{"avif", vips.ImageTypeAvif},
 			{"heif", vips.ImageTypeHeif},
@@ -161,6 +184,33 @@ func TestProcessor(t *testing.T) {
 				require.Equal(t, 0.0, maxDiff, "non-zero pixel diff means encoding was lossy")
 			})
 		}
+	})
+	t.Run("invert filter round-trip pixel-exact", func(t *testing.T) {
+		filterFn, ok := v.Filters["invert"]
+		require.True(t, ok, "invert filter must be registered")
+
+		src, err := vips.NewImageFromFile(filepath.Join(testDataDir, "gopher-front.png"), nil)
+		require.NoError(t, err)
+		defer src.Close()
+
+		out, err := vips.NewImageFromFile(filepath.Join(testDataDir, "gopher-front.png"), nil)
+		require.NoError(t, err)
+		defer out.Close()
+
+		_, err = filterFn(context.Background(), out, nil)
+		require.NoError(t, err)
+		_, err = filterFn(context.Background(), out, nil)
+		require.NoError(t, err)
+
+		require.Equal(t, src.Width(), out.Width(), "width must match")
+		require.Equal(t, src.Height(), out.Height(), "height must match")
+		require.Equal(t, src.Bands(), out.Bands(), "band count must match")
+
+		require.NoError(t, out.Subtract(src))
+		require.NoError(t, out.Abs())
+		maxDiff, err := out.Max(nil)
+		require.NoError(t, err)
+		require.Equal(t, 0.0, maxDiff, "double invert must restore original pixels")
 	})
 	t.Run("meta", func(t *testing.T) {
 		var resultDir = filepath.Join(testDataDir, "golden")
@@ -268,6 +318,10 @@ func TestProcessor(t *testing.T) {
 			{name: "blur sharpen 2", path: "200x-210/top/filters:blur(1,2):sharpen(1,2):background_color(ff0):format(jpeg):quality(70)/gopher.png"},
 			{name: "crop stretch top flip", path: "10x20:3000x5000/stretch/100x200/filters:brightness(-20):contrast(50):rgb(10,-50,30):fill(black)/gopher.png"},
 			{name: "crop-percent stretch top flip", path: "0.006120x0.008993:1.0x1.0/stretch/100x200/filters:brightness(-20):contrast(50):rgb(10,-50,30):fill(black)/gopher.png"},
+			{name: "rotate 45 still", path: "filters:rotate(45)/gopher-front.png"},
+			{name: "rotate 45 fill", path: "filters:rotate(45):fill(yellow)/gopher-front.png"},
+			{name: "rotate -45", path: "filters:rotate(-45)/gopher-front.png"},
+			{name: "rotate 45 animated", path: "filters:rotate(45)/dancing-banana.gif", arm64Golden: true},
 			{name: "padding rotation fill blur grayscale", path: "/fit-in/200x210/20x20/filters:rotate(90):rotate(270):rotate(180):fill(blur):grayscale()/gopher.png"},
 			{name: "fill round_corner", path: "fit-in/0x210/filters:fill(yellow):round_corner(40,60,green)/gopher.png"},
 			{name: "grayscale fill none", path: "fit-in/100x100/filters:fill(none)/2bands.png", checkTypeOnly: true},
@@ -664,6 +718,49 @@ func TestProcessor(t *testing.T) {
 		defer img.Close()
 		assert.Greater(t, img.Height(), img.PageHeight(), "expected animated frames to be preserved")
 	})
+	t.Run("animated gif filters apply without dropping frames", func(t *testing.T) {
+		app := imagor.New(
+			imagor.WithLoaders(filestorage.New(testDataDir)),
+			imagor.WithUnsafe(true),
+			imagor.WithProcessors(NewProcessor()),
+		)
+		require.NoError(t, app.Startup(context.Background()))
+		t.Cleanup(func() {
+			assert.NoError(t, app.Shutdown(context.Background()))
+		})
+
+		fetch := func(path string) []byte {
+			w := httptest.NewRecorder()
+			app.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/unsafe/"+path, nil))
+			require.Equal(t, 200, w.Code)
+			return w.Body.Bytes()
+		}
+
+		baseline := fetch("dancing-banana.gif")
+		baseGIF, err := gif.DecodeAll(bytes.NewReader(baseline))
+		require.NoError(t, err)
+
+		for _, tt := range []struct {
+			name string
+			path string
+		}{
+			{name: "pixelate", path: "filters:pixelate(8)/dancing-banana.gif"},
+			{name: "saturation", path: "filters:saturation(-50)/dancing-banana.gif"},
+			{name: "hue", path: "filters:hue(60)/dancing-banana.gif"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				body := fetch(tt.path)
+				assert.False(t, bytes.Equal(baseline, body), "filtered GIF must differ from baseline")
+
+				gotGIF, err := gif.DecodeAll(bytes.NewReader(body))
+				require.NoError(t, err)
+				assert.Len(t, gotGIF.Image, len(baseGIF.Image), "frame count must be preserved")
+				assert.Equal(t, baseGIF.Delay, gotGIF.Delay, "frame delays must be preserved")
+				assert.Equal(t, baseGIF.Disposal, gotGIF.Disposal, "disposal method must be preserved")
+				assert.Equal(t, baseGIF.LoopCount, gotGIF.LoopCount, "loop count must be preserved")
+			})
+		}
+	})
 	t.Run("resolution exceeded bmp 2", func(t *testing.T) {
 		app := imagor.New(
 			imagor.WithLoaders(filestorage.New(testDataDir)),
@@ -724,6 +821,29 @@ func TestProcessor(t *testing.T) {
 		w := httptest.NewRecorder()
 		app.ServeHTTP(w, httptest.NewRequest(
 			http.MethodGet, "/unsafe/dancing-banana.gif", nil))
+		assert.Equal(t, 422, w.Code)
+	})
+	t.Run("no memory leak when filter errors after image has been loaded", func(t *testing.T) {
+		app := imagor.New(
+			imagor.WithLoaders(filestorage.New(testDataDir)),
+			imagor.WithUnsafe(true),
+			imagor.WithDebug(true),
+			imagor.WithLogger(zap.NewExample()),
+			imagor.WithProcessors(NewProcessor(
+				WithDebug(true),
+				WithFilter("error", func(_ context.Context, _ *vips.Image, _ imagor.LoadFunc, _ ...string) (bool, error) {
+					return false, imagor.NewError("boom", 422)
+				}),
+			)),
+		)
+		require.NoError(t, app.Startup(context.Background()))
+		t.Cleanup(func() {
+			assert.NoError(t, app.Shutdown(context.Background()))
+		})
+		// memory leaks are caught by the ReportLeaks check
+		w := httptest.NewRecorder()
+		app.ServeHTTP(w, httptest.NewRequest(
+			http.MethodGet, "/unsafe/filters:error()/gopher-front.png", nil))
 		assert.Equal(t, 422, w.Code)
 	})
 	t.Run("image cache — LoadFromCache returns cached blob", func(t *testing.T) {
@@ -823,6 +943,20 @@ func TestProcessor(t *testing.T) {
 		assert.Nil(t, img)
 		assert.Equal(t, imagor.ErrUnsupportedFormat, err)
 	})
+	t.Run("source reader prefers read seeker by default", func(t *testing.T) {
+		payload := []byte("plain-text-payload")
+		blob := imagor.NewBlob(func() (io.ReadCloser, int64, error) {
+			return &nonSeekableReadCloser{Reader: bytes.NewReader(payload)}, int64(len(payload)), nil
+		})
+
+		p := NewProcessor()
+		reader, err := p.newSourceReaderFromBlob(blob)
+		require.NoError(t, err)
+		defer func() { _ = reader.Close() }()
+
+		_, ok := reader.(io.ReadSeeker)
+		assert.True(t, ok, "default source reader should be seekable")
+	})
 	t.Run("raw routed to dcrawload when available", func(t *testing.T) {
 		// BlobTypeRAF (Fuji RAF) with hasDcrawload=true must be routed to dcrawload,
 		// not fall through to ImageMagick. Fake data causes a dcrawload parse
@@ -865,6 +999,36 @@ func TestProcessor(t *testing.T) {
 		defer img.Close()
 		assert.Greater(t, img.Width(), 0)
 		assert.Greater(t, img.Height(), 0)
+	})
+	t.Run("avif and heif thumbnail source loads", func(t *testing.T) {
+		ctx := context.Background()
+		p := NewProcessor(WithDebug(true))
+		require.NoError(t, p.Startup(ctx))
+		defer func() { assert.NoError(t, p.Shutdown(ctx)) }()
+
+		for _, tc := range []struct {
+			name string
+			file string
+			typ  imagor.BlobType
+		}{
+			{name: "avif", file: "gopher-front.avif", typ: imagor.BlobTypeAVIF},
+			{name: "heif", file: "gopher-front.heif", typ: imagor.BlobTypeHEIF},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				blob := imagor.NewBlobFromFile(filepath.Join(testDataDir, tc.file))
+				require.Equal(t, tc.typ, blob.BlobType())
+
+				img, err := p.NewThumbnail(ctx, blob, 67, 67, vips.InterestingNone, vips.SizeDown, 1, 1, 0)
+				require.NoError(t, err)
+				require.NotNil(t, img)
+				defer img.Close()
+
+				assert.Greater(t, img.Width(), 0)
+				assert.Greater(t, img.PageHeight(), 0)
+				assert.LessOrEqual(t, img.Width(), 67)
+				assert.LessOrEqual(t, img.PageHeight(), 67)
+			})
+		}
 	})
 	t.Run("cr2 is BlobTypeCR2 and IsRaw", func(t *testing.T) {
 		// BlobTypeCR2 must be detected by TIFF header + "CR" at [8:10].

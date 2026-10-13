@@ -40,7 +40,8 @@ func contextDone(ctx context.Context) {
 type contextRotateKey struct{}
 
 type contextRotate struct {
-	Rotate90 bool
+	Rotate90        bool
+	RotateArbitrary bool
 }
 
 // setRotate90 toggles rotation flag in current context (local to processing level)
@@ -58,6 +59,24 @@ func isRotate90(ctx context.Context) bool {
 	return false
 }
 
+// setRotateArbitrary sets flag indicating a non-orthogonal rotation was applied.
+// This signals to downstream filters (e.g. fill) that the image dimensions have
+// changed unpredictably and they should use the current image bounds rather than
+// the original target dimensions.
+func setRotateArbitrary(ctx context.Context) {
+	if r, ok := ctx.Value(contextRotateKey{}).(*contextRotate); ok {
+		r.RotateArbitrary = true
+	}
+}
+
+// isRotateArbitrary checks if an arbitrary-angle rotation was applied.
+func isRotateArbitrary(ctx context.Context) bool {
+	if r, ok := ctx.Value(contextRotateKey{}).(*contextRotate); ok {
+		return r.RotateArbitrary
+	}
+	return false
+}
+
 // withContext creates processing context with both global resource tracking and local rotation state
 // - Preserves parent's resource context (if exists) for global cleanup tracking
 // - Always creates fresh rotation context (local to this processing level)
@@ -71,4 +90,27 @@ func withContext(ctx context.Context) context.Context {
 	// This prevents parent's rotation from affecting nested image() processing
 	ctx = context.WithValue(ctx, contextRotateKey{}, &contextRotate{})
 	return ctx
+}
+
+// Report context for a path a filter loads (fresh for each filter).
+type contextReportsKey struct{}
+
+type contextReports struct {
+	child *filterReports
+}
+
+// withReportsHolder gives the next handler somewhere to leave the report for a
+// path it loaded, so the dispatch loop can nest it under that filter's entry.
+// The holder is shared by pointer: the handler writes into it and the loop reads
+// it once the handler returns.
+func withReportsHolder(ctx context.Context) (context.Context, *contextReports) {
+	h := &contextReports{}
+	return context.WithValue(ctx, contextReportsKey{}, h), h
+}
+
+// setChildReports records what the filters in a loaded path did.
+func setChildReports(ctx context.Context, r *filterReports) {
+	if h, ok := ctx.Value(contextReportsKey{}).(*contextReports); ok {
+		h.child = r
+	}
 }

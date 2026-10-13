@@ -3,8 +3,8 @@ import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
 
 const config: Config = {
-  title: "imagor documentation",
-  tagline: "Fast, secure image processing server and Go library",
+  title: "imagor docs",
+  tagline: "Fast, secure libvips-based image processing server and Go library",
   favicon: "img/icon.png",
 
   // Set the production url of your site here
@@ -49,6 +49,14 @@ const config: Config = {
           routeBasePath: "/",
         },
         blog: false,
+        sitemap: {
+          ignorePatterns: ["/search", "/404.html"],
+          createSitemapItems: async ({ defaultCreateSitemapItems, ...rest }) => {
+            const items = await defaultCreateSitemapItems(rest);
+
+            return items.filter((item) => !item.url.includes("/category/"));
+          },
+        },
         theme: {
           customCss: "./src/css/custom.css",
         },
@@ -69,6 +77,17 @@ const config: Config = {
   ],
 
   themeConfig: {
+    image: "img/icon.png",
+    metadata: [
+      {
+        property: "og:site_name",
+        content: "imagor docs",
+      },
+      {
+        name: "twitter:card",
+        content: "summary",
+      },
+    ],
     navbar: {
       title: "imagor",
       items: [
@@ -77,10 +96,6 @@ const config: Config = {
           label: "Ecosystem",
           position: "left",
           items: [
-            {
-              label: "Imagor Cloud",
-              href: "https://imagor.net",
-            },
             {
               label: "imagor",
               to: "/",
@@ -92,6 +107,10 @@ const config: Config = {
             {
               label: "imagorface",
               to: "/imagorface",
+            },
+            {
+              label: "Imagor Studio",
+              href: "https://studio.imagor.net",
             },
           ],
         },
@@ -105,10 +124,10 @@ const config: Config = {
           position: "right",
         },
         {
-          href: "https://imagor.net",
-          label: "Imagor Cloud",
+          label: "Consulting",
+          to: "/consulting",
           position: "right",
-          className: "navbar-buy-button",
+          className: "navbar-consulting-button",
         },
       ],
     },
@@ -116,12 +135,29 @@ const config: Config = {
       style: "dark",
       links: [
         {
-          title: "Ecosystem",
+          title: "Docs",
           items: [
             {
-              label: "Imagor Cloud",
-              href: "https://imagor.net",
+              label: "Getting Started",
+              to: "/",
             },
+            {
+              label: "Benchmarks",
+              to: "/benchmarks",
+            },
+            {
+              label: "Image Endpoint",
+              to: "/image-endpoint",
+            },
+            {
+              label: "Configuration",
+              to: "/configuration",
+            },
+          ],
+        },
+        {
+          title: "Ecosystem",
+          items: [
             {
               label: "imagor",
               to: "/",
@@ -134,6 +170,10 @@ const config: Config = {
               label: "imagorface",
               to: "/imagorface",
             },
+            {
+              label: "Imagor Studio",
+              href: "https://studio.imagor.net",
+            },
           ],
         },
         {
@@ -144,13 +184,21 @@ const config: Config = {
               href: "https://github.com/cshum/imagor",
             },
             {
+              label: "Sponsor",
+              href: "https://github.com/sponsors/cshum",
+            },
+            {
               label: "Docker Hub",
               href: "https://hub.docker.com/r/shumc/imagor",
+            },
+            {
+              label: "Consulting",
+              to: "/consulting",
             },
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} imagor.`,
+      copyright: `Copyright © ${new Date().getFullYear()} <a href="https://cshum.com">Adrian C. Shum</a>`,
     },
     prism: {
       theme: prismThemes.github,

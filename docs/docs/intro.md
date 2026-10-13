@@ -1,9 +1,18 @@
 ---
+title: imagor
+sidebar_label: Getting Started
 sidebar_position: 1
 slug: /
+description: Fast, secure libvips-based image processing server and Go library with thumbor-compatible URLs, streaming, storage backends, and production-ready deployment options.
+keywords:
+  - imagor docs
+  - imagor
+  - libvips image server
+  - thumbor compatible image server
+  - go image processing server
 ---
 
-# Getting Started
+# imagor
 
 [![Test Status](https://github.com/cshum/imagor/workflows/test/badge.svg)](https://github.com/cshum/imagor/actions/workflows/test.yml)
 [![Codecov](https://img.shields.io/codecov/c/github/cshum/imagor)](https://codecov.io/gh/cshum/imagor)
@@ -11,17 +20,20 @@ slug: /
 
 imagor is a fast, secure image processing server and Go library.
 
-imagor uses one of the most efficient image processing libraries
-[libvips](https://github.com/libvips/libvips) with Go binding [vipsgen](https://github.com/cshum/vipsgen) — also available for low-level libvips operations directly in Go. It is typically 4-8x [faster](https://github.com/libvips/libvips/wiki/Speed-and-memory-use) than using the quickest ImageMagick settings.
-imagor implements libvips [streaming](https://www.libvips.org/2019/11/29/True-streaming-for-libvips.html) that facilitates parallel processing pipelines, achieving high network throughput.
+imagor uses one of the most efficient image processing libraries,
+[libvips](https://github.com/libvips/libvips) with the Go binding [vipsgen](https://github.com/cshum/vipsgen). It is typically 4-8x [faster](https://github.com/libvips/libvips/wiki/Speed-and-memory-use) than using the quickest ImageMagick settings.
+imagor implements libvips [streaming](https://www.libvips.org/2019/11/29/True-streaming-for-libvips.html) to facilitate parallel processing pipelines and achieve high network throughput.
+[Benchmarks](./benchmarks) show imagor is one of the fastest image processing servers.
 
-imagor features a ton of image processing use cases, available as a HTTP server with first-class Docker support. It adopts the [thumbor](https://thumbor.readthedocs.io/en/latest/usage.html#image-endpoint) URL syntax representing a high-performance drop-in replacement.
+imagor supports a wide range of image-processing use cases, available as a HTTP server with first-class Docker support. It adopts the thumbor URL syntax representing a high-performance drop-in replacement.
 
 imagor is built with speed, security and extensibility in mind. Alongside there is [imagorvideo](./imagorvideo.md) bringing video thumbnail capability through ffmpeg C bindings.
 
 ```bash
 docker run -p 8000:8000 shumc/imagor -imagor-unsafe -imagor-auto-webp
 ```
+
+[![Deploy on Elestio](https://elest.io/images/logos/deploy-to-elestio-btn.png)](https://dash.elest.io/deploy?soft=Imagor&id=203)
 
 Original images:
 

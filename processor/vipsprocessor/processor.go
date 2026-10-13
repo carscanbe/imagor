@@ -3,6 +3,7 @@ package vipsprocessor
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"runtime"
 	"strings"
@@ -15,8 +16,13 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// FilterFunc filter handler function
-type FilterFunc func(ctx context.Context, img *vips.Image, load imagor.LoadFunc, args ...string) (err error)
+// FilterFunc filter handler function.
+//
+// processed reports whether the filter recognised its arguments and performed the
+// operation; false means it declined and left the image unchanged, whether from
+// missing or invalid arguments, a documented no-op, or a missing dependency such
+// as no configured Detector.
+type FilterFunc func(ctx context.Context, img *vips.Image, load imagor.LoadFunc, args ...string) (processed bool, err error)
 
 // FilterMap filter handler map
 type FilterMap map[string]FilterFunc
@@ -26,27 +32,29 @@ var processorCount int
 
 // Processor implements imagor.Processor interface
 type Processor struct {
-	Filters            FilterMap
-	FallbackFunc       FallbackFunc
-	Detectors          []imagor.Detector
-	DetectorProbeSize  int
-	DisableBlur        bool
-	DisableFilters     []string
-	MaxFilterOps       int
-	Logger             *zap.Logger
-	Concurrency        int
-	MaxCacheFiles      int
-	MaxCacheMem        int
-	MaxCacheSize       int
-	MaxWidth           int
-	MaxHeight          int
-	MaxResolution      int
-	MaxAnimationFrames int
-	MozJPEG            bool
-	StripMetadata      bool
-	AvifSpeed          int
-	Unlimited          bool
-	Debug              bool
+	Filters              FilterMap
+	FallbackFunc         FallbackFunc
+	Detectors            []imagor.Detector
+	DetectorProbeSize    int
+	DisableBlur          bool
+	DisableFilters       []string
+	MaxFilterOps         int
+	Logger               *zap.Logger
+	Concurrency          int
+	MaxCacheFiles        int
+	MaxCacheMem          int
+	MaxCacheSize         int
+	MaxWidth             int
+	MaxHeight            int
+	MaxResolution        int
+	MaxAnimationFrames   int
+	MozJPEG              bool
+	StripColorProfile    bool
+	StripMetadata        bool
+	AvifSpeed            int
+	VectorDisableTargets int64
+	Unlimited            bool
+	Debug                bool
 
 	// Image cache settings
 	CacheSize      int64
@@ -70,6 +78,7 @@ func NewProcessor(options ...Option) *Processor {
 		Concurrency:        1,
 		MaxFilterOps:       -1,
 		MaxAnimationFrames: -1,
+		AvifSpeed:          8,
 		Logger:             zap.NewNop(),
 		disableFilters:     map[string]bool{},
 		CacheMaxWidth:      2400,
@@ -84,6 +93,7 @@ func NewProcessor(options ...Option) *Processor {
 		"label":            label,
 		"text":             text,
 		"grayscale":        grayscale,
+		"invert":           invert,
 		"brightness":       brightness,
 		"background_color": backgroundColor,
 		"contrast":         contrast,
@@ -143,10 +153,11 @@ func (v *Processor) Startup(ctx context.Context) error {
 			}, vips.LogLevelError)
 		}
 		vips.Startup(&vips.Config{
-			MaxCacheFiles:    v.MaxCacheFiles,
-			MaxCacheMem:      v.MaxCacheMem,
-			MaxCacheSize:     v.MaxCacheSize,
-			ConcurrencyLevel: v.Concurrency,
+			MaxCacheFiles:        v.MaxCacheFiles,
+			MaxCacheMem:          v.MaxCacheMem,
+			MaxCacheSize:         v.MaxCacheSize,
+			ConcurrencyLevel:     v.Concurrency,
+			VectorDisableTargets: v.VectorDisableTargets,
 		})
 	}
 	v.hasDcrawload = vips.HasOperation("dcrawload_source")
@@ -203,6 +214,21 @@ func (v *Processor) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+func (v *Processor) newSourceReaderFromBlob(blob *imagor.Blob) (io.ReadCloser, error) {
+	reader, _, err := blob.NewReadSeeker()
+	return reader, err
+}
+
+func (v *Processor) newSourceFromBlob(ctx context.Context, blob *imagor.Blob) (*vips.Source, error) {
+	reader, err := v.newSourceReaderFromBlob(blob)
+	if err != nil {
+		return nil, err
+	}
+	src := vips.NewSource(reader)
+	contextDefer(ctx, src.Close)
+	return src, nil
+}
+
 func (v *Processor) newImageFromBlob(
 	ctx context.Context, blob *imagor.Blob, options *vips.LoadOptions,
 ) (*vips.Image, error) {
@@ -247,12 +273,10 @@ func (v *Processor) newImageFromBlob(
 		}
 		// dcrawload failed — it's a real TIFF or unsupported, proceed with normal loading
 	}
-	reader, _, err := blob.NewReader()
+	src, err := v.newSourceFromBlob(ctx, blob)
 	if err != nil {
 		return nil, err
 	}
-	src := vips.NewSource(reader)
-	contextDefer(ctx, src.Close)
 	img, err := vips.NewImageFromSource(src, options)
 	if err != nil && v.FallbackFunc != nil {
 		src.Close()
@@ -263,12 +287,10 @@ func (v *Processor) newImageFromBlob(
 
 // dcrawloadFromBlob loads a RAW camera image using vips_dcrawload_source.
 func (v *Processor) dcrawloadFromBlob(ctx context.Context, blob *imagor.Blob) (*vips.Image, error) {
-	reader, _, err := blob.NewReader()
+	src, err := v.newSourceFromBlob(ctx, blob)
 	if err != nil {
 		return nil, err
 	}
-	src := vips.NewSource(reader)
-	contextDefer(ctx, src.Close)
 	img, err := vips.NewDcrawloadSource(src, vips.DefaultDcrawloadSourceOptions())
 	if err != nil {
 		src.Close()
@@ -277,19 +299,17 @@ func (v *Processor) dcrawloadFromBlob(ctx context.Context, blob *imagor.Blob) (*
 	return img, nil
 }
 
-func newThumbnailFromBlob(
+func (v *Processor) newThumbnailFromBlob(
 	ctx context.Context, blob *imagor.Blob,
 	width, height int, crop vips.Interesting, size vips.Size, options *vips.LoadOptions,
 ) (*vips.Image, error) {
 	if blob == nil || blob.IsEmpty() {
 		return nil, imagor.ErrNotFound
 	}
-	reader, _, err := blob.NewReader()
+	src, err := v.newSourceFromBlob(ctx, blob)
 	if err != nil {
 		return nil, err
 	}
-	src := vips.NewSource(reader)
-	contextDefer(ctx, src.Close)
 	var optionString string
 	if options != nil {
 		optionString = options.OptionString()
@@ -324,6 +344,12 @@ func (v *Processor) NewThumbnail(
 	var options = &vips.LoadOptions{}
 	if dpi > 0 {
 		options.Dpi = dpi
+	}
+	if blob != nil {
+		switch blob.BlobType() {
+		case imagor.BlobTypeAVIF, imagor.BlobTypeHEIF:
+			options.Thumbnail = true
+		}
 	}
 	options.Unlimited = v.Unlimited && unlimitedSupportedByLoader(blob)
 	var err error
@@ -364,9 +390,10 @@ func (v *Processor) NewThumbnail(
 		}
 	} else {
 		switch blob.BlobType() {
-		case imagor.BlobTypeJPEG, imagor.BlobTypeGIF, imagor.BlobTypeWEBP:
-			// only allow real thumbnail for jpeg gif webp
-			img, err = newThumbnailFromBlob(ctx, blob, width, height, crop, size, options)
+		case imagor.BlobTypeJPEG, imagor.BlobTypeGIF, imagor.BlobTypeWEBP,
+			imagor.BlobTypeAVIF, imagor.BlobTypeHEIF:
+			// Use libvips thumbnail-source loaders when the format supports it.
+			img, err = v.newThumbnailFromBlob(ctx, blob, width, height, crop, size, options)
 		default:
 			img, err = v.newThumbnailFallback(ctx, blob, width, height, crop, size, options)
 		}
